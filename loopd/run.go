@@ -82,7 +82,7 @@ func newListenerCfg(config *Config, rpcCfg RPCConfig) *listenerCfg {
 		getLnd: func(network lndclient.Network, cfg *lndConfig) (
 			*lndclient.GrpcLndServices, error) {
 
-			syncCtx, cancel := context.WithCancel(
+			callerCtx, cancel := context.WithCancel(
 				context.Background(),
 			)
 			defer cancel()
@@ -90,11 +90,12 @@ func newListenerCfg(config *Config, rpcCfg RPCConfig) *listenerCfg {
 			svcCfg := &lndclient.LndServicesConfig{
 				LndAddress:            cfg.Host,
 				Network:               network,
-				MacaroonDir:           cfg.MacaroonDir,
+				CustomMacaroonPath:    cfg.MacaroonPath,
 				TLSPath:               cfg.TLSPath,
 				CheckVersion:          LoopMinRequiredLndVersion,
 				BlockUntilChainSynced: true,
-				ChainSyncCtx:          syncCtx,
+				CallerCtx:             callerCtx,
+				BlockUntilUnlocked:    true,
 			}
 
 			// If a custom lnd connection is specified we use that
@@ -120,7 +121,7 @@ func newListenerCfg(config *Config, rpcCfg RPCConfig) *listenerCfg {
 				// If our sync context was cancelled, we know
 				// that the function exited, which means that
 				// our client synced.
-				case <-syncCtx.Done():
+				case <-callerCtx.Done():
 				}
 			}()
 

@@ -10,6 +10,7 @@ import (
 	"github.com/lightninglabs/loop"
 	"github.com/lightninglabs/loop/labels"
 	"github.com/lightninglabs/loop/loopdb"
+	"github.com/lightninglabs/loop/swap"
 	"github.com/lightninglabs/loop/test"
 	"github.com/lightningnetwork/lnd/clock"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
@@ -24,6 +25,7 @@ var (
 
 	chanID1 = lnwire.NewShortChanIDFromInt(1)
 	chanID2 = lnwire.NewShortChanIDFromInt(2)
+	chanID3 = lnwire.NewShortChanIDFromInt(3)
 
 	peer1 = route.Vertex{1}
 	peer2 = route.Vertex{2}
@@ -99,13 +101,21 @@ var (
 	// and restricted to a channel that we do not use in our tests.
 	autoOutContract = &loopdb.LoopOutContract{
 		SwapContract: loopdb.SwapContract{
-			Label:          labels.AutoOutLabel(),
+			Label:          labels.AutoloopLabel(swap.TypeOut),
 			InitiationTime: testBudgetStart,
 		},
 		OutgoingChanSet: loopdb.ChannelSet{999},
 	}
 
 	testRestrictions = NewRestrictions(1, 10000)
+
+	// noneDisqualified can be used in tests where we don't have any
+	// disqualified channels so that we can use require.Equal.
+	noneDisqualified = make(map[lnwire.ShortChannelID]Reason)
+
+	// noPeersDisqualified can be used in tests where we don't have any
+	// disqualified peers so that we can use require.Equal.
+	noPeersDisqualified = make(map[route.Vertex]Reason)
 )
 
 // newTestConfig creates a default test config.
@@ -120,7 +130,7 @@ func newTestConfig() (*Config, *test.LndMockServices) {
 	)
 
 	return &Config{
-		LoopOutRestrictions: func(_ context.Context) (*Restrictions,
+		Restrictions: func(_ context.Context, _ swap.Type) (*Restrictions,
 			error) {
 
 			return testRestrictions, nil
@@ -275,30 +285,42 @@ func TestRestrictedSuggestions(t *testing.T) {
 				defaultFailureBackoff * -3,
 			),
 		}
+
+		chanRules = map[lnwire.ShortChannelID]*ThresholdRule{
+			chanID1: chanRule,
+			chanID2: chanRule,
+		}
 	)
 
 	tests := []struct {
-		name     string
-		channels []lndclient.ChannelInfo
-		loopOut  []*loopdb.LoopOut
-		loopIn   []*loopdb.LoopIn
-		expected []loop.OutRequest
+		name      string
+		channels  []lndclient.ChannelInfo
+		loopOut   []*loopdb.LoopOut
+		loopIn    []*loopdb.LoopIn
+		chanRules map[lnwire.ShortChannelID]*ThresholdRule
+		peerRules map[route.Vertex]*ThresholdRule
+		expected  *Suggestions
 	}{
 		{
 			name: "no existing swaps",
 			channels: []lndclient.ChannelInfo{
 				channel1,
 			},
-			loopOut: nil,
-			loopIn:  nil,
-			expected: []loop.OutRequest{
-				chan1Rec,
+			loopOut:   nil,
+			loopIn:    nil,
+			chanRules: chanRules,
+			expected: &Suggestions{
+				OutSwaps: []loop.OutRequest{
+					chan1Rec,
+				},
+				DisqualifiedChans: noneDisqualified,
+				DisqualifiedPeers: noPeersDisqualified,
 			},
 		},
 		{
 			name: "unrestricted loop out",
 			channels: []lndclient.ChannelInfo{
-				channel1, channel2,
+				channel1,
 			},
 			loopOut: []*loopdb.LoopOut{
 				{
@@ -307,12 +329,19 @@ func TestRestrictedSuggestions(t *testing.T) {
 					},
 				},
 			},
-			expected: nil,
+			chanRules: chanRules,
+			expected: &Suggestions{
+				OutSwaps: []loop.OutRequest{
+					chan1Rec,
+				},
+				DisqualifiedChans: noneDisqualified,
+				DisqualifiedPeers: noPeersDisqualified,
+			},
 		},
 		{
 			name: "unrestricted loop in",
 			channels: []lndclient.ChannelInfo{
-				channel1, channel2,
+				channel1,
 			},
 			loopIn: []*loopdb.LoopIn{
 				{
@@ -321,7 +350,14 @@ func TestRestrictedSuggestions(t *testing.T) {
 					},
 				},
 			},
-			expected: nil,
+			chanRules: chanRules,
+			expected: &Suggestions{
+				OutSwaps: []loop.OutRequest{
+					chan1Rec,
+				},
+				DisqualifiedChans: noneDisqualified,
+				DisqualifiedPeers: noPeersDisqualified,
+			},
 		},
 		{
 			name: "restricted loop out",
@@ -333,8 +369,15 @@ func TestRestrictedSuggestions(t *testing.T) {
 					Contract: chan1Out,
 				},
 			},
-			expected: []loop.OutRequest{
-				chan2Rec,
+			chanRules: chanRules,
+			expected: &Suggestions{
+				OutSwaps: []loop.OutRequest{
+					chan2Rec,
+				},
+				DisqualifiedChans: map[lnwire.ShortChannelID]Reason{
+					chanID1: ReasonLoopOut,
+				},
+				DisqualifiedPeers: noPeersDisqualified,
 			},
 		},
 		{
@@ -349,8 +392,15 @@ func TestRestrictedSuggestions(t *testing.T) {
 					},
 				},
 			},
-			expected: []loop.OutRequest{
-				chan1Rec,
+			chanRules: chanRules,
+			expected: &Suggestions{
+				OutSwaps: []loop.OutRequest{
+					chan1Rec,
+				},
+				DisqualifiedChans: map[lnwire.ShortChannelID]Reason{
+					chanID2: ReasonLoopIn,
+				},
+				DisqualifiedPeers: noPeersDisqualified,
 			},
 		},
 		{
@@ -368,7 +418,13 @@ func TestRestrictedSuggestions(t *testing.T) {
 					},
 				},
 			},
-			expected: nil,
+			chanRules: chanRules,
+			expected: &Suggestions{
+				DisqualifiedChans: map[lnwire.ShortChannelID]Reason{
+					chanID1: ReasonFailureBackoff,
+				},
+				DisqualifiedPeers: noPeersDisqualified,
+			},
 		},
 		{
 			name: "swap failed before cutoff",
@@ -385,8 +441,13 @@ func TestRestrictedSuggestions(t *testing.T) {
 					},
 				},
 			},
-			expected: []loop.OutRequest{
-				chan1Rec,
+			chanRules: chanRules,
+			expected: &Suggestions{
+				OutSwaps: []loop.OutRequest{
+					chan1Rec,
+				},
+				DisqualifiedChans: noneDisqualified,
+				DisqualifiedPeers: noPeersDisqualified,
 			},
 		},
 		{
@@ -404,7 +465,37 @@ func TestRestrictedSuggestions(t *testing.T) {
 					},
 				},
 			},
-			expected: nil,
+			chanRules: chanRules,
+			expected: &Suggestions{
+				DisqualifiedChans: map[lnwire.ShortChannelID]Reason{
+					chanID1: ReasonLoopOut,
+				},
+				DisqualifiedPeers: noPeersDisqualified,
+			},
+		},
+		{
+			name: "existing on peer's channel",
+			channels: []lndclient.ChannelInfo{
+				channel1,
+				{
+					ChannelID:   chanID3.ToUint64(),
+					PubKeyBytes: peer1,
+				},
+			},
+			loopOut: []*loopdb.LoopOut{
+				{
+					Contract: chan1Out,
+				},
+			},
+			peerRules: map[route.Vertex]*ThresholdRule{
+				peer1: NewThresholdRule(0, 50),
+			},
+			expected: &Suggestions{
+				DisqualifiedChans: noneDisqualified,
+				DisqualifiedPeers: map[route.Vertex]Reason{
+					peer1: ReasonLoopOut,
+				},
+			},
 		},
 	}
 
@@ -425,9 +516,12 @@ func TestRestrictedSuggestions(t *testing.T) {
 			lnd.Channels = testCase.channels
 
 			params := defaultParameters
-			params.ChannelRules = map[lnwire.ShortChannelID]*ThresholdRule{
-				chanID1: chanRule,
-				chanID2: chanRule,
+			if testCase.chanRules != nil {
+				params.ChannelRules = testCase.chanRules
+			}
+
+			if testCase.peerRules != nil {
+				params.PeerRules = testCase.peerRules
 			}
 
 			testSuggestSwaps(
@@ -442,21 +536,30 @@ func TestRestrictedSuggestions(t *testing.T) {
 // fee is above and below the configured limit.
 func TestSweepFeeLimit(t *testing.T) {
 	tests := []struct {
-		name    string
-		feeRate chainfee.SatPerKWeight
-		swaps   []loop.OutRequest
+		name        string
+		feeRate     chainfee.SatPerKWeight
+		suggestions *Suggestions
 	}{
 		{
 			name:    "fee estimate ok",
 			feeRate: defaultSweepFeeRateLimit,
-			swaps: []loop.OutRequest{
-				chan1Rec,
+			suggestions: &Suggestions{
+				OutSwaps: []loop.OutRequest{
+					chan1Rec,
+				},
+				DisqualifiedChans: noneDisqualified,
+				DisqualifiedPeers: noPeersDisqualified,
 			},
 		},
 		{
 			name:    "fee estimate above limit",
 			feeRate: defaultSweepFeeRateLimit + 1,
-			swaps:   nil,
+			suggestions: &Suggestions{
+				DisqualifiedChans: map[lnwire.ShortChannelID]Reason{
+					chanID1: ReasonSweepFees,
+				},
+				DisqualifiedPeers: noPeersDisqualified,
+			},
 		},
 	}
 
@@ -482,7 +585,7 @@ func TestSweepFeeLimit(t *testing.T) {
 
 			testSuggestSwaps(
 				t, newSuggestSwapsSetup(cfg, lnd, params),
-				testCase.swaps, nil,
+				testCase.suggestions, nil,
 			)
 		})
 	}
@@ -491,30 +594,106 @@ func TestSweepFeeLimit(t *testing.T) {
 // TestSuggestSwaps tests getting of swap suggestions based on the rules set for
 // the liquidity manager and the current set of channel balances.
 func TestSuggestSwaps(t *testing.T) {
+	singleChannel := []lndclient.ChannelInfo{
+		channel1,
+	}
+
 	tests := []struct {
-		name  string
-		rules map[lnwire.ShortChannelID]*ThresholdRule
-		swaps []loop.OutRequest
+		name        string
+		channels    []lndclient.ChannelInfo
+		rules       map[lnwire.ShortChannelID]*ThresholdRule
+		peerRules   map[route.Vertex]*ThresholdRule
+		suggestions *Suggestions
+		err         error
 	}{
 		{
-			name:  "no rules",
-			rules: map[lnwire.ShortChannelID]*ThresholdRule{},
+			name:     "no rules",
+			channels: singleChannel,
+			rules:    map[lnwire.ShortChannelID]*ThresholdRule{},
+			err:      ErrNoRules,
 		},
 		{
-			name: "loop out",
+			name:     "loop out",
+			channels: singleChannel,
 			rules: map[lnwire.ShortChannelID]*ThresholdRule{
 				chanID1: chanRule,
 			},
-			swaps: []loop.OutRequest{
-				chan1Rec,
+			suggestions: &Suggestions{
+				OutSwaps: []loop.OutRequest{
+					chan1Rec,
+				},
+				DisqualifiedChans: noneDisqualified,
+				DisqualifiedPeers: noPeersDisqualified,
 			},
 		},
 		{
-			name: "no rule for channel",
+			name:     "no rule for channel",
+			channels: singleChannel,
 			rules: map[lnwire.ShortChannelID]*ThresholdRule{
 				chanID2: NewThresholdRule(10, 10),
 			},
-			swaps: nil,
+			suggestions: &Suggestions{
+				DisqualifiedChans: noneDisqualified,
+				DisqualifiedPeers: noPeersDisqualified,
+			},
+		},
+		{
+			name: "multiple peer rules",
+			channels: []lndclient.ChannelInfo{
+				{
+					PubKeyBytes:   peer1,
+					ChannelID:     chanID1.ToUint64(),
+					Capacity:      20000,
+					LocalBalance:  8000,
+					RemoteBalance: 12000,
+				},
+				{
+					PubKeyBytes:   peer1,
+					ChannelID:     chanID2.ToUint64(),
+					Capacity:      10000,
+					LocalBalance:  9000,
+					RemoteBalance: 1000,
+				},
+				{
+					PubKeyBytes:   peer2,
+					ChannelID:     chanID3.ToUint64(),
+					Capacity:      5000,
+					LocalBalance:  2000,
+					RemoteBalance: 3000,
+				},
+			},
+			peerRules: map[route.Vertex]*ThresholdRule{
+				peer1: NewThresholdRule(80, 0),
+				peer2: NewThresholdRule(40, 50),
+			},
+			suggestions: &Suggestions{
+				OutSwaps: []loop.OutRequest{
+					{
+						Amount: 10000,
+						OutgoingChanSet: loopdb.ChannelSet{
+							chanID1.ToUint64(),
+							chanID2.ToUint64(),
+						},
+						MaxPrepayRoutingFee: ppmToSat(
+							testQuote.PrepayAmount,
+							defaultPrepayRoutingFeePPM,
+						),
+						MaxSwapRoutingFee: ppmToSat(
+							10000,
+							defaultRoutingFeePPM,
+						),
+						MaxMinerFee:     defaultMaximumMinerFee,
+						MaxSwapFee:      testQuote.SwapFee,
+						MaxPrepayAmount: testQuote.PrepayAmount,
+						SweepConfTarget: loop.DefaultSweepConfTarget,
+						Initiator:       autoloopSwapInitiator,
+					},
+				},
+				DisqualifiedChans: noneDisqualified,
+				DisqualifiedPeers: map[route.Vertex]Reason{
+					peer2: ReasonLiquidityOk,
+				},
+			},
 		},
 	}
 
@@ -524,16 +703,20 @@ func TestSuggestSwaps(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			cfg, lnd := newTestConfig()
 
-			lnd.Channels = []lndclient.ChannelInfo{
-				channel1,
-			}
+			lnd.Channels = testCase.channels
 
 			params := defaultParameters
-			params.ChannelRules = testCase.rules
+			if testCase.rules != nil {
+				params.ChannelRules = testCase.rules
+			}
+
+			if testCase.peerRules != nil {
+				params.PeerRules = testCase.peerRules
+			}
 
 			testSuggestSwaps(
 				t, newSuggestSwapsSetup(cfg, lnd, params),
-				testCase.swaps, nil,
+				testCase.suggestions, testCase.err,
 			)
 		})
 	}
@@ -542,15 +725,19 @@ func TestSuggestSwaps(t *testing.T) {
 // TestFeeLimits tests limiting of swap suggestions by fees.
 func TestFeeLimits(t *testing.T) {
 	tests := []struct {
-		name     string
-		quote    *loop.LoopOutQuote
-		expected []loop.OutRequest
+		name        string
+		quote       *loop.LoopOutQuote
+		suggestions *Suggestions
 	}{
 		{
 			name:  "fees ok",
 			quote: testQuote,
-			expected: []loop.OutRequest{
-				chan1Rec,
+			suggestions: &Suggestions{
+				OutSwaps: []loop.OutRequest{
+					chan1Rec,
+				},
+				DisqualifiedChans: noneDisqualified,
+				DisqualifiedPeers: noPeersDisqualified,
 			},
 		},
 		{
@@ -560,6 +747,12 @@ func TestFeeLimits(t *testing.T) {
 				PrepayAmount: defaultMaximumPrepay + 1,
 				MinerFee:     50,
 			},
+			suggestions: &Suggestions{
+				DisqualifiedChans: map[lnwire.ShortChannelID]Reason{
+					chanID1: ReasonPrepay,
+				},
+				DisqualifiedPeers: noPeersDisqualified,
+			},
 		},
 		{
 			name: "insufficient miner fee",
@@ -567,6 +760,12 @@ func TestFeeLimits(t *testing.T) {
 				SwapFee:      1,
 				PrepayAmount: 100,
 				MinerFee:     defaultMaximumMinerFee + 1,
+			},
+			suggestions: &Suggestions{
+				DisqualifiedChans: map[lnwire.ShortChannelID]Reason{
+					chanID1: ReasonMinerFee,
+				},
+				DisqualifiedPeers: noPeersDisqualified,
 			},
 		},
 		{
@@ -576,6 +775,12 @@ func TestFeeLimits(t *testing.T) {
 				SwapFee:      38,
 				PrepayAmount: 100,
 				MinerFee:     500,
+			},
+			suggestions: &Suggestions{
+				DisqualifiedChans: map[lnwire.ShortChannelID]Reason{
+					chanID1: ReasonSwapFee,
+				},
+				DisqualifiedPeers: noPeersDisqualified,
 			},
 		},
 	}
@@ -603,7 +808,7 @@ func TestFeeLimits(t *testing.T) {
 
 			testSuggestSwaps(
 				t, newSuggestSwapsSetup(cfg, lnd, params),
-				testCase.expected, nil,
+				testCase.suggestions, nil,
 			)
 		})
 	}
@@ -634,8 +839,8 @@ func TestFeeBudget(t *testing.T) {
 		// last update time to their total cost.
 		existingSwaps map[time.Time]btcutil.Amount
 
-		// expectedSwaps is the set of swaps we expect to be suggested.
-		expectedSwaps []loop.OutRequest
+		// suggestions is the set of swaps we expect to be suggested.
+		suggestions *Suggestions
 	}{
 		{
 			// Two swaps will cost (78+5000)*2, set exactly 10156
@@ -643,8 +848,12 @@ func TestFeeBudget(t *testing.T) {
 			name:        "budget for 2 swaps, no existing",
 			budget:      10156,
 			maxMinerFee: 5000,
-			expectedSwaps: []loop.OutRequest{
-				chan1Rec, chan2Rec,
+			suggestions: &Suggestions{
+				OutSwaps: []loop.OutRequest{
+					chan1Rec, chan2Rec,
+				},
+				DisqualifiedChans: noneDisqualified,
+				DisqualifiedPeers: noPeersDisqualified,
 			},
 		},
 		{
@@ -653,8 +862,14 @@ func TestFeeBudget(t *testing.T) {
 			name:        "budget for 1 swaps, no existing",
 			budget:      10155,
 			maxMinerFee: 5000,
-			expectedSwaps: []loop.OutRequest{
-				chan1Rec,
+			suggestions: &Suggestions{
+				OutSwaps: []loop.OutRequest{
+					chan1Rec,
+				},
+				DisqualifiedChans: map[lnwire.ShortChannelID]Reason{
+					chanID2: ReasonBudgetInsufficient,
+				},
+				DisqualifiedPeers: noPeersDisqualified,
 			},
 		},
 		{
@@ -666,8 +881,12 @@ func TestFeeBudget(t *testing.T) {
 			existingSwaps: map[time.Time]btcutil.Amount{
 				testBudgetStart.Add(time.Hour * -1): 200,
 			},
-			expectedSwaps: []loop.OutRequest{
-				chan1Rec, chan2Rec,
+			suggestions: &Suggestions{
+				OutSwaps: []loop.OutRequest{
+					chan1Rec, chan2Rec,
+				},
+				DisqualifiedChans: noneDisqualified,
+				DisqualifiedPeers: noPeersDisqualified,
 			},
 		},
 		{
@@ -679,8 +898,14 @@ func TestFeeBudget(t *testing.T) {
 			existingSwaps: map[time.Time]btcutil.Amount{
 				testBudgetStart.Add(time.Hour): 500,
 			},
-			expectedSwaps: []loop.OutRequest{
-				chan1Rec,
+			suggestions: &Suggestions{
+				OutSwaps: []loop.OutRequest{
+					chan1Rec,
+				},
+				DisqualifiedChans: map[lnwire.ShortChannelID]Reason{
+					chanID2: ReasonBudgetInsufficient,
+				},
+				DisqualifiedPeers: noPeersDisqualified,
 			},
 		},
 		{
@@ -690,7 +915,13 @@ func TestFeeBudget(t *testing.T) {
 			existingSwaps: map[time.Time]btcutil.Amount{
 				testBudgetStart.Add(time.Hour): 500,
 			},
-			expectedSwaps: nil,
+			suggestions: &Suggestions{
+				DisqualifiedChans: map[lnwire.ShortChannelID]Reason{
+					chanID1: ReasonBudgetElapsed,
+					chanID2: ReasonBudgetElapsed,
+				},
+				DisqualifiedPeers: noPeersDisqualified,
+			},
 		},
 	}
 
@@ -753,14 +984,14 @@ func TestFeeBudget(t *testing.T) {
 			// Set our custom max miner fee on each expected swap,
 			// rather than having to create multiple vars for
 			// different rates.
-			for i := range testCase.expectedSwaps {
-				testCase.expectedSwaps[i].MaxMinerFee =
+			for i := range testCase.suggestions.OutSwaps {
+				testCase.suggestions.OutSwaps[i].MaxMinerFee =
 					testCase.maxMinerFee
 			}
 
 			testSuggestSwaps(
 				t, newSuggestSwapsSetup(cfg, lnd, params),
-				testCase.expectedSwaps, nil,
+				testCase.suggestions, nil,
 			)
 		})
 	}
@@ -773,20 +1004,28 @@ func TestInFlightLimit(t *testing.T) {
 		name          string
 		maxInFlight   int
 		existingSwaps []*loopdb.LoopOut
-		expectedSwaps []loop.OutRequest
+		suggestions   *Suggestions
 	}{
 		{
 			name:        "none in flight, extra space",
 			maxInFlight: 3,
-			expectedSwaps: []loop.OutRequest{
-				chan1Rec, chan2Rec,
+			suggestions: &Suggestions{
+				OutSwaps: []loop.OutRequest{
+					chan1Rec, chan2Rec,
+				},
+				DisqualifiedChans: noneDisqualified,
+				DisqualifiedPeers: noPeersDisqualified,
 			},
 		},
 		{
 			name:        "none in flight, exact match",
 			maxInFlight: 2,
-			expectedSwaps: []loop.OutRequest{
-				chan1Rec, chan2Rec,
+			suggestions: &Suggestions{
+				OutSwaps: []loop.OutRequest{
+					chan1Rec, chan2Rec,
+				},
+				DisqualifiedChans: noneDisqualified,
+				DisqualifiedPeers: noPeersDisqualified,
 			},
 		},
 		{
@@ -797,8 +1036,14 @@ func TestInFlightLimit(t *testing.T) {
 					Contract: autoOutContract,
 				},
 			},
-			expectedSwaps: []loop.OutRequest{
-				chan1Rec,
+			suggestions: &Suggestions{
+				OutSwaps: []loop.OutRequest{
+					chan1Rec,
+				},
+				DisqualifiedChans: map[lnwire.ShortChannelID]Reason{
+					chanID2: ReasonInFlight,
+				},
+				DisqualifiedPeers: noPeersDisqualified,
 			},
 		},
 		{
@@ -809,7 +1054,13 @@ func TestInFlightLimit(t *testing.T) {
 					Contract: autoOutContract,
 				},
 			},
-			expectedSwaps: nil,
+			suggestions: &Suggestions{
+				DisqualifiedChans: map[lnwire.ShortChannelID]Reason{
+					chanID1: ReasonInFlight,
+					chanID2: ReasonInFlight,
+				},
+				DisqualifiedPeers: noPeersDisqualified,
+			},
 		},
 		{
 			name:        "max swaps exceeded",
@@ -822,7 +1073,13 @@ func TestInFlightLimit(t *testing.T) {
 					Contract: autoOutContract,
 				},
 			},
-			expectedSwaps: nil,
+			suggestions: &Suggestions{
+				DisqualifiedChans: map[lnwire.ShortChannelID]Reason{
+					chanID1: ReasonInFlight,
+					chanID2: ReasonInFlight,
+				},
+				DisqualifiedPeers: noPeersDisqualified,
+			},
 		},
 	}
 
@@ -853,7 +1110,7 @@ func TestInFlightLimit(t *testing.T) {
 
 			testSuggestSwaps(
 				t, newSuggestSwapsSetup(cfg, lnd, params),
-				testCase.expectedSwaps, nil,
+				testCase.suggestions, nil,
 			)
 		})
 	}
@@ -867,14 +1124,19 @@ func TestSizeRestrictions(t *testing.T) {
 			Maximum: 10000,
 		}
 
-		swap = loop.OutRequest{
+		outSwap = loop.OutRequest{
+			Amount:              7000,
 			OutgoingChanSet:     loopdb.ChannelSet{chanID1.ToUint64()},
 			MaxPrepayRoutingFee: prepayFee,
-			MaxMinerFee:         defaultMaximumMinerFee,
-			MaxSwapFee:          testQuote.SwapFee,
-			MaxPrepayAmount:     testQuote.PrepayAmount,
-			SweepConfTarget:     loop.DefaultSweepConfTarget,
-			Initiator:           autoloopSwapInitiator,
+			MaxSwapRoutingFee: ppmToSat(
+				7000,
+				defaultRoutingFeePPM,
+			),
+			MaxMinerFee:     defaultMaximumMinerFee,
+			MaxSwapFee:      testQuote.SwapFee,
+			MaxPrepayAmount: testQuote.PrepayAmount,
+			SweepConfTarget: loop.DefaultSweepConfTarget,
+			Initiator:       autoloopSwapInitiator,
 		}
 	)
 
@@ -889,8 +1151,8 @@ func TestSizeRestrictions(t *testing.T) {
 		// endpoint.
 		serverRestrictions []Restrictions
 
-		// expectedAmount is the amount that we expect for our swap.
-		expectedAmount btcutil.Amount
+		// suggestions is the set of suggestions we expect.
+		suggestions *Suggestions
 
 		// expectedError is the error we expect.
 		expectedError error
@@ -903,7 +1165,13 @@ func TestSizeRestrictions(t *testing.T) {
 			serverRestrictions: []Restrictions{
 				serverRestrictions, serverRestrictions,
 			},
-			expectedAmount: 7500,
+			suggestions: &Suggestions{
+				OutSwaps: []loop.OutRequest{
+					chan1Rec,
+				},
+				DisqualifiedChans: noneDisqualified,
+				DisqualifiedPeers: noPeersDisqualified,
+			},
 		},
 		{
 			name: "minimum more than server, no swap",
@@ -913,7 +1181,12 @@ func TestSizeRestrictions(t *testing.T) {
 			serverRestrictions: []Restrictions{
 				serverRestrictions, serverRestrictions,
 			},
-			expectedAmount: 0,
+			suggestions: &Suggestions{
+				DisqualifiedChans: map[lnwire.ShortChannelID]Reason{
+					chanID1: ReasonLiquidityOk,
+				},
+				DisqualifiedPeers: noPeersDisqualified,
+			},
 		},
 		{
 			name: "maximum less than server, swap happens",
@@ -923,7 +1196,13 @@ func TestSizeRestrictions(t *testing.T) {
 			serverRestrictions: []Restrictions{
 				serverRestrictions, serverRestrictions,
 			},
-			expectedAmount: 7000,
+			suggestions: &Suggestions{
+				OutSwaps: []loop.OutRequest{
+					outSwap,
+				},
+				DisqualifiedChans: noneDisqualified,
+				DisqualifiedPeers: noPeersDisqualified,
+			},
 		},
 		{
 			// Originally, our client params are ok. But then the
@@ -941,8 +1220,8 @@ func TestSizeRestrictions(t *testing.T) {
 					Maximum: 6000,
 				},
 			},
-			expectedAmount: 0,
-			expectedError:  ErrMaxExceedsServer,
+			suggestions:   nil,
+			expectedError: ErrMaxExceedsServer,
 		},
 	}
 
@@ -966,7 +1245,7 @@ func TestSizeRestrictions(t *testing.T) {
 			// our restrictions endpoint.
 			var callCount int
 
-			cfg.LoopOutRestrictions = func(_ context.Context) (
+			cfg.Restrictions = func(_ context.Context, _ swap.Type) (
 				*Restrictions, error) {
 
 				restrictions := testCase.serverRestrictions[callCount]
@@ -974,25 +1253,9 @@ func TestSizeRestrictions(t *testing.T) {
 
 				return &restrictions, nil
 			}
-
-			// If we expect a swap (non-zero amount), we add a
-			// swap to our set of expected swaps, and update amount
-			// and fee accordingly.
-			var expectedSwaps []loop.OutRequest
-			if testCase.expectedAmount != 0 {
-				swap.Amount = testCase.expectedAmount
-
-				swap.MaxSwapRoutingFee = ppmToSat(
-					testCase.expectedAmount,
-					defaultRoutingFeePPM,
-				)
-
-				expectedSwaps = append(expectedSwaps, swap)
-			}
-
 			testSuggestSwaps(
 				t, newSuggestSwapsSetup(cfg, lnd, params),
-				expectedSwaps, testCase.expectedError,
+				testCase.suggestions, testCase.expectedError,
 			)
 
 			require.Equal(
@@ -1027,7 +1290,7 @@ func newSuggestSwapsSetup(cfg *Config, lnd *test.LndMockServices,
 // use the default parameters and setup two channels (channel1 + channel2) with
 // chanRule set for each.
 func testSuggestSwaps(t *testing.T, setup *testSuggestSwapsSetup,
-	expected []loop.OutRequest, expectedErr error) {
+	expected *Suggestions, expectedErr error) {
 
 	t.Parallel()
 

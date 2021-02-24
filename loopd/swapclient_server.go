@@ -21,6 +21,8 @@ import (
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/queue"
 	"github.com/lightningnetwork/lnd/routing/route"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -572,6 +574,8 @@ func (s *swapClientServer) GetLiquidityParams(_ context.Context,
 
 	satPerByte := cfg.SweepFeeRateLimit.FeePerKVByte() / 1000
 
+	totalRules := len(cfg.ChannelRules) + len(cfg.PeerRules)
+
 	rpcCfg := &looprpc.LiquidityParameters{
 		MaxMinerFeeSat:          uint64(cfg.MaximumMinerFee),
 		MaxSwapFeePpm:           uint64(cfg.MaximumSwapFeePPM),
@@ -581,11 +585,11 @@ func (s *swapClientServer) GetLiquidityParams(_ context.Context,
 		SweepFeeRateSatPerVbyte: uint64(satPerByte),
 		SweepConfTarget:         cfg.SweepConfTarget,
 		FailureBackoffSec:       uint64(cfg.FailureBackOff.Seconds()),
-		AutoLoopOut:             cfg.AutoOut,
-		AutoOutBudgetSat:        uint64(cfg.AutoFeeBudget),
+		Autoloop:                cfg.Autoloop,
+		AutoloopBudgetSat:       uint64(cfg.AutoFeeBudget),
 		AutoMaxInFlight:         uint64(cfg.MaxAutoInFlight),
 		Rules: make(
-			[]*looprpc.LiquidityRule, 0, len(cfg.ChannelRules),
+			[]*looprpc.LiquidityRule, 0, totalRules,
 		),
 		MinSwapAmount: uint64(cfg.ClientRestrictions.Minimum),
 		MaxSwapAmount: uint64(cfg.ClientRestrictions.Maximum),
@@ -594,23 +598,35 @@ func (s *swapClientServer) GetLiquidityParams(_ context.Context,
 	// Zero golang time is different to a zero unix time, so we only set
 	// our start date if it is non-zero.
 	if !cfg.AutoFeeStartDate.IsZero() {
-		rpcCfg.AutoOutBudgetStartSec = uint64(
+		rpcCfg.AutoloopBudgetStartSec = uint64(
 			cfg.AutoFeeStartDate.Unix(),
 		)
 	}
 
 	for channel, rule := range cfg.ChannelRules {
-		rpcRule := &looprpc.LiquidityRule{
-			ChannelId:         channel.ToUint64(),
-			Type:              looprpc.LiquidityRuleType_THRESHOLD,
-			IncomingThreshold: uint32(rule.MinimumIncoming),
-			OutgoingThreshold: uint32(rule.MinimumOutgoing),
-		}
+		rpcRule := newRPCRule(channel.ToUint64(), nil, rule)
+		rpcCfg.Rules = append(rpcCfg.Rules, rpcRule)
+	}
 
+	for peer, rule := range cfg.PeerRules {
+		peer := peer
+		rpcRule := newRPCRule(0, peer[:], rule)
 		rpcCfg.Rules = append(rpcCfg.Rules, rpcRule)
 	}
 
 	return rpcCfg, nil
+}
+
+func newRPCRule(channelID uint64, peer []byte,
+	rule *liquidity.ThresholdRule) *looprpc.LiquidityRule {
+
+	return &looprpc.LiquidityRule{
+		ChannelId:         channelID,
+		Pubkey:            peer,
+		Type:              looprpc.LiquidityRuleType_THRESHOLD,
+		IncomingThreshold: uint32(rule.MinimumIncoming),
+		OutgoingThreshold: uint32(rule.MinimumOutgoing),
+	}
 }
 
 // SetLiquidityParams attempts to set our current liquidity manager's
@@ -633,12 +649,14 @@ func (s *swapClientServer) SetLiquidityParams(ctx context.Context,
 		SweepConfTarget:            in.Parameters.SweepConfTarget,
 		FailureBackOff: time.Duration(in.Parameters.FailureBackoffSec) *
 			time.Second,
-		AutoOut:         in.Parameters.AutoLoopOut,
-		AutoFeeBudget:   btcutil.Amount(in.Parameters.AutoOutBudgetSat),
+		Autoloop:        in.Parameters.Autoloop,
+		AutoFeeBudget:   btcutil.Amount(in.Parameters.AutoloopBudgetSat),
 		MaxAutoInFlight: int(in.Parameters.AutoMaxInFlight),
 		ChannelRules: make(
 			map[lnwire.ShortChannelID]*liquidity.ThresholdRule,
-			len(in.Parameters.Rules),
+		),
+		PeerRules: make(
+			map[route.Vertex]*liquidity.ThresholdRule,
 		),
 		ClientRestrictions: liquidity.Restrictions{
 			Minimum: btcutil.Amount(in.Parameters.MinSwapAmount),
@@ -647,28 +665,53 @@ func (s *swapClientServer) SetLiquidityParams(ctx context.Context,
 	}
 
 	// Zero unix time is different to zero golang time.
-	if in.Parameters.AutoOutBudgetStartSec != 0 {
+	if in.Parameters.AutoloopBudgetStartSec != 0 {
 		params.AutoFeeStartDate = time.Unix(
-			int64(in.Parameters.AutoOutBudgetStartSec), 0,
+			int64(in.Parameters.AutoloopBudgetStartSec), 0,
 		)
 	}
 
 	for _, rule := range in.Parameters.Rules {
-		var (
-			shortID = lnwire.NewShortChanIDFromInt(rule.ChannelId)
-			err     error
-		)
+		peerRule := rule.Pubkey != nil
+		chanRule := rule.ChannelId != 0
 
-		// Make sure that there are not multiple rules set for a single
-		// channel.
-		if _, ok := params.ChannelRules[shortID]; ok {
-			return nil, fmt.Errorf("multiple rules set for "+
-				"channel: %v", shortID)
-		}
-
-		params.ChannelRules[shortID], err = rpcToRule(rule)
+		liquidityRule, err := rpcToRule(rule)
 		if err != nil {
 			return nil, err
+		}
+
+		switch {
+		case peerRule && chanRule:
+			return nil, fmt.Errorf("cannot set channel: %v and "+
+				"peer: %v fields in rule", rule.ChannelId,
+				rule.Pubkey)
+
+		case peerRule:
+			pubkey, err := route.NewVertexFromBytes(rule.Pubkey)
+			if err != nil {
+				return nil, err
+			}
+
+			if _, ok := params.PeerRules[pubkey]; ok {
+				return nil, fmt.Errorf("multiple rules set "+
+					"for peer: %v", pubkey)
+			}
+
+			params.PeerRules[pubkey] = liquidityRule
+
+		case chanRule:
+			shortID := lnwire.NewShortChanIDFromInt(rule.ChannelId)
+
+			if _, ok := params.ChannelRules[shortID]; ok {
+				return nil, fmt.Errorf("multiple rules set "+
+					"for channel: %v", shortID)
+			}
+
+			params.ChannelRules[shortID] = liquidityRule
+
+		default:
+			return nil, errors.New("please set channel id or " +
+				"pubkey for rule")
 		}
 	}
 
@@ -702,14 +745,23 @@ func rpcToRule(rule *looprpc.LiquidityRule) (*liquidity.ThresholdRule, error) {
 func (s *swapClientServer) SuggestSwaps(ctx context.Context,
 	_ *looprpc.SuggestSwapsRequest) (*looprpc.SuggestSwapsResponse, error) {
 
-	swaps, err := s.liquidityMgr.SuggestSwaps(ctx, false)
-	if err != nil {
+	suggestions, err := s.liquidityMgr.SuggestSwaps(ctx, false)
+	switch err {
+	case liquidity.ErrNoRules:
+		return nil, status.Error(codes.FailedPrecondition, err.Error())
+
+	case nil:
+
+	default:
 		return nil, err
 	}
 
-	var loopOut []*looprpc.LoopOutRequest
+	var (
+		loopOut      []*looprpc.LoopOutRequest
+		disqualified []*looprpc.Disqualified
+	)
 
-	for _, swap := range swaps {
+	for _, swap := range suggestions.OutSwaps {
 		loopOut = append(loopOut, &looprpc.LoopOutRequest{
 			Amt:                 int64(swap.Amount),
 			OutgoingChanSet:     swap.OutgoingChanSet,
@@ -722,9 +774,84 @@ func (s *swapClientServer) SuggestSwaps(ctx context.Context,
 		})
 	}
 
+	for id, reason := range suggestions.DisqualifiedChans {
+		autoloopReason, err := rpcAutoloopReason(reason)
+		if err != nil {
+			return nil, err
+		}
+
+		exclChan := &looprpc.Disqualified{
+			Reason:    autoloopReason,
+			ChannelId: id.ToUint64(),
+		}
+
+		disqualified = append(disqualified, exclChan)
+	}
+
+	for pubkey, reason := range suggestions.DisqualifiedPeers {
+		autoloopReason, err := rpcAutoloopReason(reason)
+		if err != nil {
+			return nil, err
+		}
+
+		exclChan := &looprpc.Disqualified{
+			Reason: autoloopReason,
+			Pubkey: pubkey[:],
+		}
+
+		disqualified = append(disqualified, exclChan)
+	}
+
 	return &looprpc.SuggestSwapsResponse{
-		LoopOut: loopOut,
+		LoopOut:      loopOut,
+		Disqualified: disqualified,
 	}, nil
+}
+
+func rpcAutoloopReason(reason liquidity.Reason) (looprpc.AutoReason, error) {
+	switch reason {
+	case liquidity.ReasonNone:
+		return looprpc.AutoReason_AUTO_REASON_UNKNOWN, nil
+
+	case liquidity.ReasonBudgetNotStarted:
+		return looprpc.AutoReason_AUTO_REASON_BUDGET_NOT_STARTED, nil
+
+	case liquidity.ReasonSweepFees:
+		return looprpc.AutoReason_AUTO_REASON_SWEEP_FEES, nil
+
+	case liquidity.ReasonBudgetElapsed:
+		return looprpc.AutoReason_AUTO_REASON_BUDGET_ELAPSED, nil
+
+	case liquidity.ReasonInFlight:
+		return looprpc.AutoReason_AUTO_REASON_IN_FLIGHT, nil
+
+	case liquidity.ReasonSwapFee:
+		return looprpc.AutoReason_AUTO_REASON_SWAP_FEE, nil
+
+	case liquidity.ReasonMinerFee:
+		return looprpc.AutoReason_AUTO_REASON_MINER_FEE, nil
+
+	case liquidity.ReasonPrepay:
+		return looprpc.AutoReason_AUTO_REASON_PREPAY, nil
+
+	case liquidity.ReasonFailureBackoff:
+		return looprpc.AutoReason_AUTO_REASON_FAILURE_BACKOFF, nil
+
+	case liquidity.ReasonLoopOut:
+		return looprpc.AutoReason_AUTO_REASON_LOOP_OUT, nil
+
+	case liquidity.ReasonLoopIn:
+		return looprpc.AutoReason_AUTO_REASON_LOOP_IN, nil
+
+	case liquidity.ReasonLiquidityOk:
+		return looprpc.AutoReason_AUTO_REASON_LIQUIDITY_OK, nil
+
+	case liquidity.ReasonBudgetInsufficient:
+		return looprpc.AutoReason_AUTO_REASON_BUDGET_INSUFFICIENT, nil
+
+	default:
+		return 0, fmt.Errorf("unknown autoloop reason: %v", reason)
+	}
 }
 
 // processStatusUpdates reads updates on the status channel and processes them.

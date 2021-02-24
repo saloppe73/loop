@@ -1,13 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 
 	"github.com/lightninglabs/loop/liquidity"
 	"github.com/lightninglabs/loop/looprpc"
+	"github.com/lightningnetwork/lnd/routing/route"
 	"github.com/urfave/cli"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 var getLiquidityParamsCommand = cli.Command{
@@ -39,9 +44,9 @@ func getParams(ctx *cli.Context) error {
 
 var setLiquidityRuleCommand = cli.Command{
 	Name:        "setrule",
-	Usage:       "set liquidity manager rule for a channel",
-	Description: "Update or remove the liquidity rule for a channel.",
-	ArgsUsage:   "shortchanid",
+	Usage:       "set liquidity manager rule for a channel/peer",
+	Description: "Update or remove the liquidity rule for a channel/peer.",
+	ArgsUsage:   "{shortchanid |  peerpubkey}",
 	Flags: []cli.Flag{
 		cli.IntFlag{
 			Name: "incoming_threshold",
@@ -55,8 +60,9 @@ var setLiquidityRuleCommand = cli.Command{
 				"that we do not want to drop below.",
 		},
 		cli.BoolFlag{
-			Name:  "clear",
-			Usage: "remove the rule currently set for the channel.",
+			Name: "clear",
+			Usage: "remove the rule currently set for the " +
+				"channel/peer.",
 		},
 	},
 	Action: setRule,
@@ -65,13 +71,22 @@ var setLiquidityRuleCommand = cli.Command{
 func setRule(ctx *cli.Context) error {
 	// We require that a channel ID is set for this rule update.
 	if ctx.NArg() != 1 {
-		return fmt.Errorf("please set a channel id for the rule " +
-			"update")
+		return fmt.Errorf("please set a channel id or peer pubkey " +
+			"for the rule update")
 	}
 
+	var (
+		pubkey     route.Vertex
+		pubkeyRule bool
+	)
 	chanID, err := strconv.ParseUint(ctx.Args().First(), 10, 64)
 	if err != nil {
-		return fmt.Errorf("could not parse channel ID: %v", err)
+		pubkey, err = route.NewVertexFromStr(ctx.Args().First())
+		if err != nil {
+			return fmt.Errorf("please provide a valid pubkey: "+
+				"%v, or short channel ID", err)
+		}
+		pubkeyRule = true
 	}
 
 	client, cleanup, err := getClient(ctx)
@@ -98,11 +113,20 @@ func setRule(ctx *cli.Context) error {
 	)
 
 	// Run through our current set of rules and check whether we have a rule
-	// currently set for this channel. We also track a slice containing all
-	// of the rules we currently have set for other channels, because we
-	// want to leave these rules untouched.
+	// currently set for this channel or peer. We also track a slice
+	// containing all of the rules we currently have set for other channels,
+	// and peers because we want to leave these rules untouched.
 	for _, rule := range params.Rules {
-		if rule.ChannelId == chanID {
+		var (
+			channelRuleSet = rule.ChannelId != 0 &&
+				rule.ChannelId == chanID
+
+			peerRuleSet = rule.Pubkey != nil && bytes.Equal(
+				rule.Pubkey, pubkey[:],
+			)
+		)
+
+		if channelRuleSet || peerRuleSet {
 			ruleSet = true
 		} else {
 			otherRules = append(otherRules, rule)
@@ -144,6 +168,10 @@ func setRule(ctx *cli.Context) error {
 	newRule := &looprpc.LiquidityRule{
 		ChannelId: chanID,
 		Type:      looprpc.LiquidityRuleType_THRESHOLD,
+	}
+
+	if pubkeyRule {
+		newRule.Pubkey = pubkey[:]
 	}
 
 	if inboundSet {
@@ -225,10 +253,10 @@ var setParamsCommand = cli.Command{
 				"included in suggestions.",
 		},
 		cli.BoolFlag{
-			Name: "autoout",
+			Name: "autoloop",
 			Usage: "set to true to enable automated dispatch " +
-				"of loop out swaps, limited to the budget " +
-				"set by autobudget",
+				"of swaps, limited to the budget set by " +
+				"autobudget",
 		},
 		cli.Uint64Flag{
 			Name: "autobudget",
@@ -338,18 +366,18 @@ func setParams(ctx *cli.Context) error {
 		flagSet = true
 	}
 
-	if ctx.IsSet("autoout") {
-		params.AutoLoopOut = ctx.Bool("autoout")
+	if ctx.IsSet("autoloop") {
+		params.Autoloop = ctx.Bool("autoloop")
 		flagSet = true
 	}
 
 	if ctx.IsSet("autobudget") {
-		params.AutoOutBudgetSat = ctx.Uint64("autobudget")
+		params.AutoloopBudgetSat = ctx.Uint64("autobudget")
 		flagSet = true
 	}
 
 	if ctx.IsSet("budgetstart") {
-		params.AutoOutBudgetStartSec = ctx.Uint64("budgetstart")
+		params.AutoloopBudgetStartSec = ctx.Uint64("budgetstart")
 		flagSet = true
 	}
 
@@ -411,11 +439,22 @@ func suggestSwap(ctx *cli.Context) error {
 	resp, err := client.SuggestSwaps(
 		context.Background(), &looprpc.SuggestSwapsRequest{},
 	)
-	if err != nil {
+	if err == nil {
+		printRespJSON(resp)
+		return nil
+	}
+
+	// If we got an error because no rules are set, we want to display a
+	// friendly message.
+	rpcErr, ok := status.FromError(err)
+	if !ok {
 		return err
 	}
 
-	printJSON(resp)
+	if rpcErr.Code() != codes.FailedPrecondition {
+		return err
+	}
 
-	return nil
+	return errors.New("no rules set for autolooper, please set rules " +
+		"using the setrule command")
 }
